@@ -120,8 +120,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
             if data["type"] == "resolved":
                 for c in rooms[room_id]:
                     if c["user"] == username:
-                     if c["troubled"] is True:
-                          continue    
+                        if c["troubled"] is True:
+                        continue    
                         c["troubled"] = False
                 await broadcast_members()
 
