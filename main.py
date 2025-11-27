@@ -55,9 +55,16 @@ def detect_face(img):
 
 def predict_expression(face_img):
     img = transform(face_img).unsqueeze(0)
+
     with torch.no_grad():
         outputs = model(img)
-        _, pred = torch.max(outputs, 1)
+        probs = torch.softmax(outputs, dim=1)[0]
+        confidence, pred = torch.max(probs, 0)
+
+    # ★ しきい値導入（弱い表情は neutral に）
+    if confidence < 0.6:
+        return "neutral"
+
     return CLASS_NAMES[pred.item()]
 
 
@@ -70,12 +77,16 @@ async def predict(file: UploadFile = File(...)):
 
 
     if results and results.detections:
-        detection = results.detections[0]
-        bboxC = detection.location_data.relative_bounding_box
-        h, w, _ = img.shape
-        x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
-        bw, bh = int(bboxC.width * w), int(bboxC.height * h)
-        face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
+    detection = results.detections[0]
+    bboxC = detection.location_data.relative_bounding_box
+    h, w, _ = img.shape
+    x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
+    bw, bh = int(bboxC.width * w), int(bboxC.height * h)
+
+    # ★★★ ここに追加！ 顔が小さすぎる → 無視して neutral 扱い
+    if bw < 80 or bh < 80:
+        return {"expression": "neutral", "face": None}
+
         expression = predict_expression(face_img)
         return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
     return {"expression": "平常", "face": None}
