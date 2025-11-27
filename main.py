@@ -75,20 +75,21 @@ async def predict(file: UploadFile = File(...)):
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     results = detect_face(img)
 
-
     if results and results.detections:
-    detection = results.detections[0]
-    bboxC = detection.location_data.relative_bounding_box
-    h, w, _ = img.shape
-    x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
-    bw, bh = int(bboxC.width * w), int(bboxC.height * h)
+        detection = results.detections[0]
+        bboxC = detection.location_data.relative_bounding_box
+        h, w, _ = img.shape
+        x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
+        bw, bh = int(bboxC.width * w), int(bboxC.height * h)
 
-    # ★★★ ここに追加！ 顔が小さすぎる → 無視して neutral 扱い
-    if bw < 80 or bh < 80:
-        return {"expression": "neutral", "face": None}
+        # ★★★ ここに追加！ 顔が小さすぎる → 無視して neutral 扱い
+        if bw < 80 or bh < 80:
+            return {"expression": "neutral", "face": None}
 
+        face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
         expression = predict_expression(face_img)
         return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
+
     return {"expression": "平常", "face": None}
 
 
@@ -155,4 +156,3 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "leave", "user": username})
         await broadcast_members()
-
