@@ -89,62 +89,59 @@ rooms: Dict[str, List[Dict]] = {}
 async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
     await websocket.accept()
 
-
     if room_id not in rooms:
         rooms[room_id] = []
 
-
     user_data = {"ws": websocket, "user": username, "troubled": False}
     rooms[room_id].append(user_data)
-
 
     async def broadcast_members():
         users_info = [{"user": c["user"], "troubled": c.get("troubled", False)} for c in rooms[room_id]]
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "members", "users": users_info})
 
-
     # 入室通知
     for client in rooms[room_id]:
         await client["ws"].send_json({"type": "join", "user": username})
 
-
     await broadcast_members()
-
 
     try:
-    while True:
-        data = await websocket.receive_json()
+        while True:
+            data = await websocket.receive_json()
 
-        if data["type"] == "trouble":
-            for c in rooms[room_id]:
-                if c["user"] == username:
+            # ===== 困った通知 =====
+            if data["type"] == "trouble":
+                for c in rooms[room_id]:
+                    if c["user"] == username:
 
-                    # すでに困っているなら通知しない
-                    if c["troubled"]:
-                        break
+                        # すでに困っているなら通知しない
+                        if c["troubled"]:
+                            break
 
-                    # 初回だけセット
-                    c["troubled"] = True
+                        # 初回だけセット
+                        c["troubled"] = True
 
-                    await broadcast_members()
+                        await broadcast_members()
 
-                    # 初回通知だけ送る
-                    for client in rooms[room_id]:
-                        await client["ws"].send_json({
-                            "type": "trouble",
-                            "user": username,
-                            "message": "困っています！"
-                        })
+                        # 初回通知だけ送る
+                        for client in rooms[room_id]:
+                            await client["ws"].send_json({
+                                "type": "trouble",
+                                "user": username,
+                                "message": "困っています！"
+                            })
 
-        if data["type"] == "resolved":
-            for c in rooms[room_id]:
-                if c["user"] == username:
-                    c["troubled"] = False
-            await broadcast_members()
+            # ===== 解決通知 =====
+            if data["type"] == "resolved":
+                for c in rooms[room_id]:
+                    if c["user"] == username:
+                        c["troubled"] = False
+                await broadcast_members()
 
-except WebSocketDisconnect:
-    rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
-    for client in rooms[room_id]:
-        await client["ws"].send_json({"type": "leave", "user": username})
-    await broadcast_members()
+    except WebSocketDisconnect:
+        rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
+        for client in rooms[room_id]:
+            await client["ws"].send_json({"type": "leave", "user": username})
+        await broadcast_members()
+
