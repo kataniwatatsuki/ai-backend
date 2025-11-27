@@ -103,6 +103,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
                     if c["user"] == username:
                         c["troubled"] = True
                 await broadcast_members()
+
+                for client in rooms[room_id]:
+                    await client["ws"].send_json({
+                        "type": "resolved",
+                        "user": username
+                    })
                 # 個別通知
                 for client in rooms[room_id]:
                     await client["ws"].send_json({
