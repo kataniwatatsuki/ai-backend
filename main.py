@@ -118,17 +118,26 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
 
 
             if data["type"] == "trouble":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-                        c["troubled"] = True
-                await broadcast_members()
-                # 個別通知
-                for client in rooms[room_id]:
-                    await client["ws"].send_json({
-                        "type": "trouble",
-                        "user": username,
-                        "message": "困っています！"
-                    })
+    for c in rooms[room_id]:
+        if c["user"] == username:
+
+            # すでに困っているなら通知しない
+            if c["troubled"]:
+                break
+
+            # 初回だけセット
+            c["troubled"] = True
+
+            await broadcast_members()
+
+            # 初回通知だけ送る
+            for client in rooms[room_id]:
+                await client["ws"].send_json({
+                    "type": "trouble",
+                    "user": username,
+                    "message": "困っています！"
+                })
+
 
 
             if data["type"] == "resolved":
