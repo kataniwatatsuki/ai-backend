@@ -113,42 +113,38 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
 
 
     try:
-        while True:
-            data = await websocket.receive_json()
+    while True:
+        data = await websocket.receive_json()
 
+        if data["type"] == "trouble":
+            for c in rooms[room_id]:
+                if c["user"] == username:
 
-            if data["type"] == "trouble":
-    for c in rooms[room_id]:
-        if c["user"] == username:
+                    # すでに困っているなら通知しない
+                    if c["troubled"]:
+                        break
 
-            # すでに困っているなら通知しない
-            if c["troubled"]:
-                break
+                    # 初回だけセット
+                    c["troubled"] = True
 
-            # 初回だけセット
-            c["troubled"] = True
+                    await broadcast_members()
 
+                    # 初回通知だけ送る
+                    for client in rooms[room_id]:
+                        await client["ws"].send_json({
+                            "type": "trouble",
+                            "user": username,
+                            "message": "困っています！"
+                        })
+
+        if data["type"] == "resolved":
+            for c in rooms[room_id]:
+                if c["user"] == username:
+                    c["troubled"] = False
             await broadcast_members()
 
-            # 初回通知だけ送る
-            for client in rooms[room_id]:
-                await client["ws"].send_json({
-                    "type": "trouble",
-                    "user": username,
-                    "message": "困っています！"
-                })
-
-
-
-            if data["type"] == "resolved":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-                        c["troubled"] = False
-                await broadcast_members()
-
-
-    except WebSocketDisconnect:
-        rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
-        for client in rooms[room_id]:
-            await client["ws"].send_json({"type": "leave", "user": username})
-        await broadcast_members()
+except WebSocketDisconnect:
+    rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
+    for client in rooms[room_id]:
+        await client["ws"].send_json({"type": "leave", "user": username})
+    await broadcast_members()
