@@ -7,12 +7,20 @@ from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 from typing import Dict, List
 import os
+import asyncio
 
 app = FastAPI()
 
-API_KEY = os.getenv("kannkyou-api")  # ← 環境変数を取得
+# ---- Render ヘルスチェック用（最重要） ----
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "WebSocket server running"}
+
+# ---- API KEY ----
+API_KEY = os.getenv("kannkyou-api")
 print(f"API_KEY: {API_KEY}")
-# CORS 設定
+
+# ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,10 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---- モデル ----
 MODEL_PATH = "models/fine_tuned_from_efficientnet_b0_best.pth"
 CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
-# EfficientNet モデル読み込み
 num_classes = len(CLASS_NAMES)
 model = EfficientNet.from_name("efficientnet-b0")
 in_features = model._fc.in_features
@@ -32,7 +40,6 @@ model._fc = torch.nn.Linear(in_features, num_classes)
 model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
 model.eval()
 
-# 前処理
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
@@ -41,7 +48,7 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# ===== OpenCV DNN 顔検出（res10_300x300_ssd_iter_140000.caffemodel） =====
+# ---- 顔検出 ----
 FACE_PROTO = "models/deploy.prototxt"
 FACE_MODEL = "models/res10_300x300_ssd_iter_140000.caffemodel"
 face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
@@ -79,9 +86,7 @@ async def predict(file: UploadFile = File(...)):
     faces = detect_face(img)
 
     if faces:
-        x, y, bw, bh = faces[0]
-        # numpy.int64 → int に変換
-        x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+        x, y, bw, bh = map(int, faces[0])
 
         if bw < 80 or bh < 80:
             return {"expression": "neutral", "face": None}
@@ -96,7 +101,7 @@ async def predict(file: UploadFile = File(...)):
 
     return {"expression": "検出不可", "face": None}
 
-# ======== WebSocket 部分（変更なし） ========
+# ---- WebSocket ----
 rooms: Dict[str, List[Dict]] = {}
 
 @app.websocket("/ws/{room_id}/{username}")
@@ -114,10 +119,22 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "members", "users": users_info})
 
+    # 新規参加通知
     for client in rooms[room_id]:
         await client["ws"].send_json({"type": "join", "user": username})
 
     await broadcast_members()
+
+    # ---- Free Render 対策：定期 ping ----
+    async def ping_loop():
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await websocket.send_json({"type": "ping"})
+            except:
+                break
+
+    asyncio.create_task(ping_loop())
 
     try:
         while True:
@@ -126,16 +143,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
             if data["type"] == "trouble":
                 for c in rooms[room_id]:
                     if c["user"] == username:
-                        if c["troubled"]:
-                            break
-                        c["troubled"] = True
-                        await broadcast_members()
-                        for client in rooms[room_id]:
-                            await client["ws"].send_json({
-                                "type": "trouble",
-                                "user": username,
-                                "message": "困っています！"
-                            })
+                        if not c["troubled"]:
+                            c["troubled"] = True
+                            await broadcast_members()
+                            for client in rooms[room_id]:
+                                await client["ws"].send_json({
+                                    "type": "trouble",
+                                    "user": username,
+                                    "message": "困っています！"
+                                })
 
             if data["type"] == "resolved":
                 for c in rooms[room_id]:
