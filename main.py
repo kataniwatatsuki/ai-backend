@@ -77,11 +77,19 @@ async def predict(file: UploadFile = File(...)):
 
     if faces:
         x, y, bw, bh = faces[0]
+        # numpy.int64 → int に変換
+        x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+
         if bw < 80 or bh < 80:
             return {"expression": "neutral", "face": None}
+
         face_img = img[max(0, y):min(y+bh, img.shape[0]), max(0, x):min(x+bw, img.shape[1])]
         expression = predict_expression(face_img)
-        return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
+
+        return {
+            "expression": expression,
+            "face": {"x": x, "y": y, "width": bw, "height": bh}
+        }
 
     return {"expression": "平常", "face": None}
 
