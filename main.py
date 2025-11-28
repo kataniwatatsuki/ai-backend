@@ -7,14 +7,9 @@ from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
 from typing import Dict, List
-
-
-
+import asyncio
 
 app = FastAPI()
-
-
-
 
 # CORS 設定
 app.add_middleware(
@@ -25,16 +20,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
-
+# モデル設定
 MODEL_PATH = "models/fine_tuned_from_efficientnet_b0_best.pth"
 CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
-
-
-
-# EfficientNet モデル読み込み
 num_classes = len(CLASS_NAMES)
 model = EfficientNet.from_name("efficientnet-b0")
 in_features = model._fc.in_features
@@ -42,10 +31,6 @@ model._fc = torch.nn.Linear(in_features, num_classes)
 model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
 model.eval()
 
-
-
-
-# 前処理
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
@@ -54,39 +39,25 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-
-
-
+# Mediapipe 初期化（起動時のみ）
 mp_face_detection = mp.solutions.face_detection
-
-
+face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6)
 
 
 def detect_face(img):
-    with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6) as fd:
-        return fd.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return face_detection.process(rgb)
 
 
 def predict_expression(face_img):
     img = transform(face_img).unsqueeze(0)
-
-
     with torch.no_grad():
         outputs = model(img)
         probs = torch.softmax(outputs, dim=1)[0]
         confidence, pred = torch.max(probs, 0)
-
-
-    # ★ しきい値導入（弱い表情は neutral に）
     if confidence < 0.6:
         return "neutral"
-
-
     return CLASS_NAMES[pred.item()]
-
-
 
 
 @app.post("/predict")
@@ -96,7 +67,6 @@ async def predict(file: UploadFile = File(...)):
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     results = detect_face(img)
 
-
     if results and results.detections:
         detection = results.detections[0]
         bboxC = detection.location_data.relative_bounding_box
@@ -104,79 +74,59 @@ async def predict(file: UploadFile = File(...)):
         x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
         bw, bh = int(bboxC.width * w), int(bboxC.height * h)
 
-
-        # ★★★ ここに追加！ 顔が小さすぎる → 無視して neutral 扱い
         if bw < 80 or bh < 80:
             return {"expression": "neutral", "face": None}
-
 
         face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
         expression = predict_expression(face_img)
         return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
 
-
     return {"expression": "平常", "face": None}
-
-
 
 
 # ======== WebSocket ========
 rooms: Dict[str, List[Dict]] = {}
 
 
-
-
 @app.websocket("/ws/{room_id}/{username}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
     await websocket.accept()
 
-
     if room_id not in rooms:
         rooms[room_id] = []
 
-
     user_data = {"ws": websocket, "user": username, "troubled": False}
     rooms[room_id].append(user_data)
-
 
     async def broadcast_members():
         users_info = [{"user": c["user"], "troubled": c.get("troubled", False)} for c in rooms[room_id]]
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "members", "users": users_info})
 
-
     # 入室通知
     for client in rooms[room_id]:
         await client["ws"].send_json({"type": "join", "user": username})
 
-
     await broadcast_members()
 
+    async def ping_loop():
+        while True:
+            try:
+                await websocket.send_json({"type": "ping"})
+            except:
+                break
+            await asyncio.sleep(15)  # 15秒ごとに ping
+    ping_task = asyncio.create_task(ping_loop())
 
     try:
         while True:
             data = await websocket.receive_json()
 
-
-            # ===== 困った通知 =====
             if data["type"] == "trouble":
                 for c in rooms[room_id]:
-                    if c["user"] == username:
-
-
-                        # すでに困っているなら通知しない
-                        if c["troubled"]:
-                            break
-
-
-                        # 初回だけセット
+                    if c["user"] == username and not c["troubled"]:
                         c["troubled"] = True
-
-
                         await broadcast_members()
-
-
-                        # 初回通知だけ送る
                         for client in rooms[room_id]:
                             await client["ws"].send_json({
                                 "type": "trouble",
@@ -184,20 +134,16 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
                                 "message": "困っています！"
                             })
 
-
-            # ===== 解決通知 =====
             if data["type"] == "resolved":
                 for c in rooms[room_id]:
                     if c["user"] == username:
                         c["troubled"] = False
                 await broadcast_members()
 
-
     except WebSocketDisconnect:
         rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "leave", "user": username})
         await broadcast_members()
-
-
-
+    finally:
+        ping_task.cancel()
