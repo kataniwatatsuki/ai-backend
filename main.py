@@ -94,7 +94,7 @@ async def predict(file: UploadFile = File(...)):
             "face": {"x": x, "y": y, "width": bw, "height": bh}
         }
 
-    return {"expression": "平常", "face": None}
+    return {"expression": "検出不可", "face": None}
 
 # ======== WebSocket 部分（変更なし） ========
 rooms: Dict[str, List[Dict]] = {}
