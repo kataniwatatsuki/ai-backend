@@ -6,12 +6,12 @@ import torch
 from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 from typing import Dict, List
-import os
+#import os
 
 app = FastAPI()
 
-API_KEY = os.getenv("kannkyou-api")  # ← 環境変数を取得
-print(f"API_KEY: {API_KEY}")
+#API_KEY = os.getenv("kannkyou-api")  # ← 環境変数を取得
+#print(f"API_KEY: {API_KEY}")
 # CORS 設定
 app.add_middleware(
     CORSMiddleware,
