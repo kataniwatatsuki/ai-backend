@@ -1,17 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 import torch
 from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
-from typing import Dict, List
 import asyncio
+import json
 import os
+from typing import Dict, List
 
 app = FastAPI()
 
-# CORS 設定
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,9 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==============================
-# 絶対パス設定（Render で必須）
-# ==============================
+# ===== ここまで画像認識は変更なし =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
@@ -30,9 +30,6 @@ FACE_PROTO = os.path.join(MODEL_DIR, "deploy.prototxt")
 FACE_MODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
 EXPR_MODEL_PATH = os.path.join(MODEL_DIR, "fine_tuned_from_efficientnet_b0_best.pth")
 
-# ==============================
-# 表情分類モデル
-# ==============================
 CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 num_classes = len(CLASS_NAMES)
 
@@ -46,21 +43,16 @@ transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-# ==============================
-# OpenCV DNN 顔検出モデル
-# ==============================
 face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+
 
 def detect_face(img):
     h, w = img.shape[:2]
     blob = cv2.dnn.blobFromImage(
-        cv2.resize(img, (300, 300)),
-        1.0,
-        (300, 300),
+        cv2.resize(img, (300, 300)), 1.0, (300, 300),
         (104.0, 177.0, 123.0)
     )
     face_net.setInput(blob)
@@ -80,7 +72,8 @@ def detect_face(img):
         return None
 
     x1, y1, x2, y2 = best_box
-    return {"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1), "conf": float(max_conf)}
+    return {"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1)}
+
 
 def predict_expression(face_img):
     img = transform(face_img).unsqueeze(0)
@@ -92,9 +85,7 @@ def predict_expression(face_img):
         return "neutral"
     return CLASS_NAMES[int(pred.item())]
 
-# ==============================
-# /predict 修正版
-# ==============================
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
@@ -107,80 +98,90 @@ async def predict(file: UploadFile = File(...)):
 
     x, y, w, h = box["x"], box["y"], box["w"], box["h"]
     H, W, _ = img.shape
-    face_img = img[max(0, y): min(y + h, H), max(0, x): min(x + w, W)]
+    face_img = img[max(0, y):min(y+h, H), max(0, x):min(x+w, W)]
 
     if face_img.size == 0:
         return {"expression": "neutral", "face": None}
 
     expression = predict_expression(face_img)
 
-    # numpy 型を全て int/float に変換して返す
-    face_data = {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
-    return {"expression": str(expression), "face": face_data}
+    face = {"x": x, "y": y, "width": w, "height": h}
+    return {"expression": expression, "face": face}
+
 
 # ==============================
-# WebSocket 部分はそのまま
+# 🔵 SSE 用データ管理
 # ==============================
 rooms: Dict[str, List[Dict]] = {}
+listeners: Dict[str, List[asyncio.Queue]] = {}  # ← SSE クライアントごとの Queue
 
-@app.websocket("/ws/{room_id}/{username}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
-    await websocket.accept()
 
-    if room_id not in rooms:
-        rooms[room_id] = []
+def broadcast(room_id: str, message: dict):
+    """特定の部屋に SSE でブロードキャスト"""
+    if room_id not in listeners:
+        return
+    for q in listeners[room_id]:
+        q.put_nowait(message)
 
-    user_data = {"ws": websocket, "user": username, "troubled": False}
-    rooms[room_id].append(user_data)
 
-    async def broadcast_members():
-        users_info = [{"user": c["user"], "troubled": c["troubled"]} for c in rooms[room_id]]
-        for client in rooms[room_id]:
-            await client["ws"].send_json({"type": "members", "users": users_info})
+# ==============================
+# 🔵 クライアント → サーバー
+# ==============================
+@app.post("/trouble/{room_id}/{username}")
+async def trouble(room_id: str, username: str):
+    """困っている発火"""
+    for u in rooms.get(room_id, []):
+        if u["user"] == username:
+            u["troubled"] = True
 
-    # 入室通知
-    for client in rooms[room_id]:
-        await client["ws"].send_json({"type": "join", "user": username})
+    broadcast(room_id, {"type": "members", "users": rooms[room_id]})
+    broadcast(room_id, {"type": "trouble", "user": username})
+    return {"status": "ok"}
 
-    await broadcast_members()
 
-    async def ping_loop():
-        while True:
-            try:
-                await websocket.send_json({"type": "ping"})
-            except:
-                break
-            await asyncio.sleep(15)
+@app.post("/resolve/{room_id}/{username}")
+async def resolve(room_id: str, username: str):
+    """困っている解除"""
+    for u in rooms.get(room_id, []):
+        if u["user"] == username:
+            u["troubled"] = False
 
-    ping_task = asyncio.create_task(ping_loop())
+    broadcast(room_id, {"type": "members", "users": rooms[room_id]})
+    return {"status": "ok"}
 
-    try:
-        while True:
-            data = await websocket.receive_json()
 
-            if data["type"] == "trouble":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-                        c["troubled"] = True
-                await broadcast_members()
+@app.post("/join/{room_id}/{username}")
+async def join(room_id: str, username: str):
+    """部屋に参加"""
+    rooms.setdefault(room_id, [])
+    listeners.setdefault(room_id, [])
 
-                for client in rooms[room_id]:
-                    await client["ws"].send_json({
-                        "type": "trouble",
-                        "user": username,
-                        "message": "困っています！"
-                    })
+    if not any(u["user"] == username for u in rooms[room_id]):
+        rooms[room_id].append({"user": username, "troubled": False})
 
-            if data["type"] == "resolved":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-                        c["troubled"] = False
-                await broadcast_members()
+    broadcast(room_id, {"type": "members", "users": rooms[room_id]})
+    broadcast(room_id, {"type": "join", "user": username})
+    return {"status": "joined"}
 
-    except WebSocketDisconnect:
-        rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
-        for client in rooms[room_id]:
-            await client["ws"].send_json({"type": "leave", "user": username})
-        await broadcast_members()
-    finally:
-        ping_task.cancel()
+
+# ==============================
+# 🔵 サーバー → クライアント（SSE）
+# ==============================
+@app.get("/stream/{room_id}")
+async def stream(room_id: str):
+    """SSE ストリーム"""
+    q = asyncio.Queue()
+    listeners.setdefault(room_id, [])
+    listeners[room_id].append(q)
+
+    async def event_generator():
+        try:
+            while True:
+                msg = await q.get()
+                yield f"data: {json.dumps(msg)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            listeners[room_id].remove(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
