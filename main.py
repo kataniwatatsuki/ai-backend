@@ -51,14 +51,11 @@ transform = transforms.Compose([
 ])
 
 # ==============================
-# OpenCV DNN 顔検出モデル読み込み
+# OpenCV DNN 顔検出モデル
 # ==============================
-#!!! ここが重要 → 正しい順番
 face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
 
-
 def detect_face(img):
-    """OpenCV DNNを使った顔検出（最大信頼度の顔のみ）"""
     h, w = img.shape[:2]
     blob = cv2.dnn.blobFromImage(
         cv2.resize(img, (300, 300)),
@@ -73,7 +70,7 @@ def detect_face(img):
     best_box = None
 
     for i in range(detections.shape[2]):
-        conf = detections[0, 0, i, 2]
+        conf = float(detections[0, 0, i, 2])
         if conf > 0.5 and conf > max_conf:
             box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             best_box = box.astype(int)
@@ -83,8 +80,7 @@ def detect_face(img):
         return None
 
     x1, y1, x2, y2 = best_box
-    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "conf": max_conf}
-
+    return {"x": int(x1), "y": int(y1), "w": int(x2 - x1), "h": int(y2 - y1), "conf": float(max_conf)}
 
 def predict_expression(face_img):
     img = transform(face_img).unsqueeze(0)
@@ -92,13 +88,12 @@ def predict_expression(face_img):
         outputs = model(img)
         probs = torch.softmax(outputs, dim=1)[0]
         confidence, pred = torch.max(probs, 0)
-    if confidence < 0.6:
+    if float(confidence) < 0.6:
         return "neutral"
-    return CLASS_NAMES[pred.item()]
-
+    return CLASS_NAMES[int(pred.item())]
 
 # ==============================
-# /predict
+# /predict 修正版
 # ==============================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -112,24 +107,21 @@ async def predict(file: UploadFile = File(...)):
 
     x, y, w, h = box["x"], box["y"], box["w"], box["h"]
     H, W, _ = img.shape
-
     face_img = img[max(0, y): min(y + h, H), max(0, x): min(x + w, W)]
 
     if face_img.size == 0:
         return {"expression": "neutral", "face": None}
 
     expression = predict_expression(face_img)
-    return {
-        "expression": expression,
-        "face": {"x": x, "y": y, "width": w, "height": h}
-    }
 
+    # numpy 型を全て int/float に変換して返す
+    face_data = {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+    return {"expression": str(expression), "face": face_data}
 
 # ==============================
-# WebSocket（元のまま）
+# WebSocket 部分はそのまま
 # ==============================
 rooms: Dict[str, List[Dict]] = {}
-
 
 @app.websocket("/ws/{room_id}/{username}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
