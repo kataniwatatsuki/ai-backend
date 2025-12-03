@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
-import mediapipe as mp
 from typing import Dict, List
 import asyncio
 
@@ -39,14 +38,49 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# Mediapipe 初期化（起動時のみ）
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.6)
+# =====================================================
+# OpenCV DNN で顔検出（mediapipe の代わり）
+# =====================================================
+proto_path = "deploy.prototxt"
+model_path = "res10_300x300_ssd_iter_140000.caffemodel"
+
+face_net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
 
 
 def detect_face(img):
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return face_detection.process(rgb)
+    """OpenCV DNN で最大信頼度の顔を検出する"""
+    h, w = img.shape[:2]
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(img, (300, 300)),
+        1.0,
+        (300, 300),
+        (104.0, 177.0, 123.0)
+    )
+
+    face_net.setInput(blob)
+    detections = face_net.forward()
+
+    max_conf = 0
+    best_box = None
+
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > 0.5 and conf > max_conf:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            best_box = box.astype(int)
+            max_conf = conf
+
+    if best_box is None:
+        return None
+
+    x1, y1, x2, y2 = best_box
+    return {
+        "x": x1,
+        "y": y1,
+        "w": x2 - x1,
+        "h": y2 - y1,
+        "conf": max_conf,
+    }
 
 
 def predict_expression(face_img):
@@ -60,31 +94,44 @@ def predict_expression(face_img):
     return CLASS_NAMES[pred.item()]
 
 
+# =====================================================
+# POST 画像から表情推論
+# =====================================================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     np_arr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    results = detect_face(img)
 
-    if results and results.detections:
-        detection = results.detections[0]
-        bboxC = detection.location_data.relative_bounding_box
-        h, w, _ = img.shape
-        x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
-        bw, bh = int(bboxC.width * w), int(bboxC.height * h)
+    box = detect_face(img)
+    if not box:
+        return {"expression": "neutral", "face": None}
 
-        if bw < 80 or bh < 80:
-            return {"expression": "neutral", "face": None}
+    x, y, w, h = box["x"], box["y"], box["w"], box["h"]
+    H, W, _ = img.shape
 
-        face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
-        expression = predict_expression(face_img)
-        return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
+    x2, y2 = x + w, y + h
+    face_img = img[max(0, y): min(y2, H), max(0, x): min(x2, W)]
 
-    return {"expression": "平常", "face": None}
+    if face_img.size == 0:
+        return {"expression": "neutral", "face": None}
+
+    expression = predict_expression(face_img)
+
+    return {
+        "expression": expression,
+        "face": {
+            "x": x,
+            "y": y,
+            "width": w,
+            "height": h
+        }
+    }
 
 
-# ======== WebSocket ========
+# =====================================================
+# WebSocket
+# =====================================================
 rooms: Dict[str, List[Dict]] = {}
 
 
@@ -99,7 +146,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
     rooms[room_id].append(user_data)
 
     async def broadcast_members():
-        users_info = [{"user": c["user"], "troubled": c.get("troubled", False)} for c in rooms[room_id]]
+        users_info = [{"user": c["user"], "troubled": c.get("troubled", False)}
+                      for c in rooms[room_id]]
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "members", "users": users_info})
 
@@ -115,7 +163,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
                 await websocket.send_json({"type": "ping"})
             except:
                 break
-            await asyncio.sleep(15)  # 15秒ごとに ping
+            await asyncio.sleep(15)
+
     ping_task = asyncio.create_task(ping_loop())
 
     try:
