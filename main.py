@@ -53,7 +53,8 @@ transform = transforms.Compose([
 # ==============================
 # OpenCV DNN 顔検出モデル読み込み
 # ==============================
-face_net = cv2.dnn.readNet(FACE_MODEL, FACE_PROTO)
+#!!! ここが重要 → 正しい順番
+face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
 
 
 def detect_face(img):
@@ -125,7 +126,7 @@ async def predict(file: UploadFile = File(...)):
 
 
 # ==============================
-# WebSocket (元のまま)
+# WebSocket（元のまま）
 # ==============================
 rooms: Dict[str, List[Dict]] = {}
 
