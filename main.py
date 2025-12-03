@@ -7,6 +7,7 @@ from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 from typing import Dict, List
 import asyncio
+import os
 
 app = FastAPI()
 
@@ -19,15 +20,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# モデル設定
-MODEL_PATH = "models/fine_tuned_from_efficientnet_b0_best.pth"
-CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+# ==============================
+# 絶対パス設定（Render で必須）
+# ==============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
+FACE_PROTO = os.path.join(MODEL_DIR, "deploy.prototxt")
+FACE_MODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+EXPR_MODEL_PATH = os.path.join(MODEL_DIR, "fine_tuned_from_efficientnet_b0_best.pth")
+
+# ==============================
+# 表情分類モデル
+# ==============================
+CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 num_classes = len(CLASS_NAMES)
+
 model = EfficientNet.from_name("efficientnet-b0")
 in_features = model._fc.in_features
 model._fc = torch.nn.Linear(in_features, num_classes)
-model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+model.load_state_dict(torch.load(EXPR_MODEL_PATH, map_location="cpu"))
 model.eval()
 
 transform = transforms.Compose([
@@ -38,17 +50,14 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# =====================================================
-# OpenCV DNN で顔検出（mediapipe の代わり）
-# =====================================================
-proto_path = "deploy.prototxt"
-model_path = "res10_300x300_ssd_iter_140000.caffemodel"
-
-face_net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
+# ==============================
+# OpenCV DNN 顔検出モデル読み込み
+# ==============================
+face_net = cv2.dnn.readNet(FACE_MODEL, FACE_PROTO)
 
 
 def detect_face(img):
-    """OpenCV DNN で最大信頼度の顔を検出する"""
+    """OpenCV DNNを使った顔検出（最大信頼度の顔のみ）"""
     h, w = img.shape[:2]
     blob = cv2.dnn.blobFromImage(
         cv2.resize(img, (300, 300)),
@@ -56,7 +65,6 @@ def detect_face(img):
         (300, 300),
         (104.0, 177.0, 123.0)
     )
-
     face_net.setInput(blob)
     detections = face_net.forward()
 
@@ -74,13 +82,7 @@ def detect_face(img):
         return None
 
     x1, y1, x2, y2 = best_box
-    return {
-        "x": x1,
-        "y": y1,
-        "w": x2 - x1,
-        "h": y2 - y1,
-        "conf": max_conf,
-    }
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "conf": max_conf}
 
 
 def predict_expression(face_img):
@@ -94,9 +96,9 @@ def predict_expression(face_img):
     return CLASS_NAMES[pred.item()]
 
 
-# =====================================================
-# POST 画像から表情推論
-# =====================================================
+# ==============================
+# /predict
+# ==============================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
@@ -110,28 +112,21 @@ async def predict(file: UploadFile = File(...)):
     x, y, w, h = box["x"], box["y"], box["w"], box["h"]
     H, W, _ = img.shape
 
-    x2, y2 = x + w, y + h
-    face_img = img[max(0, y): min(y2, H), max(0, x): min(x2, W)]
+    face_img = img[max(0, y): min(y + h, H), max(0, x): min(x + w, W)]
 
     if face_img.size == 0:
         return {"expression": "neutral", "face": None}
 
     expression = predict_expression(face_img)
-
     return {
         "expression": expression,
-        "face": {
-            "x": x,
-            "y": y,
-            "width": w,
-            "height": h
-        }
+        "face": {"x": x, "y": y, "width": w, "height": h}
     }
 
 
-# =====================================================
-# WebSocket
-# =====================================================
+# ==============================
+# WebSocket (元のまま)
+# ==============================
 rooms: Dict[str, List[Dict]] = {}
 
 
@@ -146,8 +141,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
     rooms[room_id].append(user_data)
 
     async def broadcast_members():
-        users_info = [{"user": c["user"], "troubled": c.get("troubled", False)}
-                      for c in rooms[room_id]]
+        users_info = [{"user": c["user"], "troubled": c["troubled"]} for c in rooms[room_id]]
         for client in rooms[room_id]:
             await client["ws"].send_json({"type": "members", "users": users_info})
 
@@ -173,15 +167,16 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
 
             if data["type"] == "trouble":
                 for c in rooms[room_id]:
-                    if c["user"] == username and not c["troubled"]:
+                    if c["user"] == username:
                         c["troubled"] = True
-                        await broadcast_members()
-                        for client in rooms[room_id]:
-                            await client["ws"].send_json({
-                                "type": "trouble",
-                                "user": username,
-                                "message": "困っています！"
-                            })
+                await broadcast_members()
+
+                for client in rooms[room_id]:
+                    await client["ws"].send_json({
+                        "type": "trouble",
+                        "user": username,
+                        "message": "困っています！"
+                    })
 
             if data["type"] == "resolved":
                 for c in rooms[room_id]:
