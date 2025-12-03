@@ -21,7 +21,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.get("/健康")
+def health_check():
+    return {"status": "ok"}
 # ===== ここまで画像認識は変更なし =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
