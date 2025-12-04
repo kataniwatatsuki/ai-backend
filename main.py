@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
@@ -6,17 +6,18 @@ import torch
 from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
-from typing import Dict, List
+from typing import Dict
+import socketio
 
-
-
-
+# ======== Socket.IO サーバー ========
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins="*"
+)
 app = FastAPI()
+app.mount("/socket.io", socketio.ASGIApp(sio))
 
-
-
-
-# CORS 設定
+# ======== CORS ========
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,16 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
-
+# ======== EfficientNet モデル ========
 MODEL_PATH = "models/fine_tuned_from_efficientnet_b0_best.pth"
 CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
-
-
-
-# EfficientNet モデル読み込み
 num_classes = len(CLASS_NAMES)
 model = EfficientNet.from_name("efficientnet-b0")
 in_features = model._fc.in_features
@@ -42,10 +37,6 @@ model._fc = torch.nn.Linear(in_features, num_classes)
 model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
 model.eval()
 
-
-
-
-# 前処理
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
@@ -54,12 +45,7 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-
-
-
 mp_face_detection = mp.solutions.face_detection
-
-
 
 
 def detect_face(img):
@@ -67,35 +53,29 @@ def detect_face(img):
         return fd.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 
-
-
 def predict_expression(face_img):
     img = transform(face_img).unsqueeze(0)
-
 
     with torch.no_grad():
         outputs = model(img)
         probs = torch.softmax(outputs, dim=1)[0]
         confidence, pred = torch.max(probs, 0)
 
-
-    # ★ しきい値導入（弱い表情は neutral に）
     if confidence < 0.6:
         return "neutral"
-
 
     return CLASS_NAMES[pred.item()]
 
 
-
-
+# ========================
+#   /predict 表情認識API
+# ========================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     np_arr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     results = detect_face(img)
-
 
     if results and results.detections:
         detection = results.detections[0]
@@ -104,97 +84,92 @@ async def predict(file: UploadFile = File(...)):
         x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
         bw, bh = int(bboxC.width * w), int(bboxC.height * h)
 
-
-        # ★★★ ここに追加！ 顔が小さすぎる → 無視して neutral 扱い
         if bw < 80 or bh < 80:
             return {"expression": "neutral", "face": None}
-
 
         face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
         expression = predict_expression(face_img)
         return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
 
-
     return {"expression": "平常", "face": None}
 
 
+# ========================
+#     Socket.IO ルーム管理
+# ========================
+rooms: Dict[str, Dict[str, Dict]] = {}
 
 
-# ======== WebSocket ========
-rooms: Dict[str, List[Dict]] = {}
+def get_members(room_id: str):
+    if room_id not in rooms:
+        return []
+    return [
+        {"user": data["user"], "troubled": data["troubled"]}
+        for sid, data in rooms[room_id].items()
+    ]
 
 
+# ===== 接続 =====
+@sio.event
+async def connect(sid, environ):
+    print(f"🔌 Connected: {sid}")
+    await sio.save_session(sid, {})  # 推奨（安定性UP）
 
 
-@app.websocket("/ws/{room_id}/{username}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, username: str):
-    await websocket.accept()
+# ===== 切断 =====
+@sio.event
+async def disconnect(sid):
+    print(f"❌ Disconnected: {sid}")
 
+    for room_id, users in list(rooms.items()):
+        if sid in users:
+            username = users[sid]["user"]
+            del users[sid]
+
+            # 全員抜けたら room 削除
+            if not users:
+                del rooms[room_id]
+
+            await sio.emit("leave", {"user": username}, room=room_id)
+            await sio.emit("members", {"users": get_members(room_id)}, room=room_id)
+            break
+
+
+# ===== 入室 =====
+@sio.event
+async def join_room(sid, data):
+    room_id = data["room"]
+    username = data["user"]
+
+    await sio.enter_room(sid, room_id)
 
     if room_id not in rooms:
-        rooms[room_id] = []
+        rooms[room_id] = {}
+
+    rooms[room_id][sid] = {"user": username, "troubled": False}
+
+    await sio.emit("join", {"user": username}, room=room_id)
+    await sio.emit("members", {"users": get_members(room_id)}, room=room_id)
 
 
-    user_data = {"ws": websocket, "user": username, "troubled": False}
-    rooms[room_id].append(user_data)
+# ===== 困った通知 =====
+@sio.event
+async def trouble(sid, data):
+    room_id = data["room"]
+    username = data["user"]
+
+    rooms[room_id][sid]["troubled"] = True
+
+    await sio.emit("members", {"users": get_members(room_id)}, room=room_id)
+    await sio.emit("trouble", {"user": username, "message": "困っています！"}, room=room_id)
 
 
-    async def broadcast_members():
-        users_info = [{"user": c["user"], "troubled": c.get("troubled", False)} for c in rooms[room_id]]
-        for client in rooms[room_id]:
-            await client["ws"].send_json({"type": "members", "users": users_info})
+# ===== 解決通知 =====
+@sio.event
+async def resolved(sid, data):
+    room_id = data["room"]
+    username = data["user"]
 
+    rooms[room_id][sid]["troubled"] = False
 
-    # 入室通知
-    for client in rooms[room_id]:
-        await client["ws"].send_json({"type": "join", "user": username})
-
-
-    await broadcast_members()
-
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-
-
-            # ===== 困った通知 =====
-            if data["type"] == "trouble":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-
-
-                        # すでに困っているなら通知しない
-                        if c["troubled"]:
-                            break
-
-
-                        # 初回だけセット
-                        c["troubled"] = True
-
-
-                        await broadcast_members()
-
-
-                        # 初回通知だけ送る
-                        for client in rooms[room_id]:
-                            await client["ws"].send_json({
-                                "type": "trouble",
-                                "user": username,
-                                "message": "困っています！"
-                            })
-
-
-            # ===== 解決通知 =====
-            if data["type"] == "resolved":
-                for c in rooms[room_id]:
-                    if c["user"] == username:
-                        c["troubled"] = False
-                await broadcast_members()
-
-
-    except WebSocketDisconnect:
-        rooms[room_id] = [c for c in rooms[room_id] if c["ws"] != websocket]
-        for client in rooms[room_id]:
-            await client["ws"].send_json({"type": "leave", "user": username})
-        await broadcast_members()
+    await sio.emit("members", {"users": get_members(room_id)}, room=room_id)
