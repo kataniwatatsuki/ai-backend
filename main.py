@@ -4,10 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 import json
-from uuid import uuid4
-from typing import Dict
+from typing import Dict, List
 
-# --- image/model imports (your existing model parts) ---
+# model imports (あなたの既存コードを流用)
 import cv2
 import numpy as np
 import torch
@@ -15,22 +14,17 @@ from torchvision import transforms
 from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
 
-# -------------------------
-# FastAPI app
-# -------------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番では制限することを検討
+    allow_origins=["*"],  # 本番はVercelドメインに限定推奨
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------
-# Model (same as you had)
-# -------------------------
+# ---------- model (あなたの既存) ----------
 MODEL_PATH = "models/fine_tuned_from_efficientnet_b0_best.pth"
 CLASS_NAMES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
@@ -63,9 +57,7 @@ def predict_expression(face_img):
         confidence, pred = torch.max(probs, 0)
     return CLASS_NAMES[pred.item()] if confidence >= 0.6 else "neutral"
 
-# -------------------------
-# /predict endpoint (unchanged)
-# -------------------------
+# ---------------- predict ----------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
@@ -79,146 +71,117 @@ async def predict(file: UploadFile = File(...)):
         h, w, _ = img.shape
         x, y = int(bboxC.xmin * w), int(bboxC.ymin * h)
         bw, bh = int(bboxC.width * w), int(bboxC.height * h)
-
         if bw < 80 or bh < 80:
             return {"expression": "neutral", "face": None}
-
         face_img = img[max(0, y):min(y + bh, h), max(0, x):min(x + bw, w)]
         expression = predict_expression(face_img)
         return {"expression": expression, "face": {"x": x, "y": y, "width": bw, "height": bh}}
-
     return {"expression": "neutral", "face": None}
 
-# -------------------------
-# Room management for SSE
-# -------------------------
-# rooms: { room_id: { "members": {sid: {user, troubled}}, "queues": [asyncio.Queue(), ...] } }
+# ---------------- rooms & queues ----------------
+# rooms: { room_id: { "members": {user: {"troubled":bool}}, "queues": [q1,q2,..] } }
 rooms: Dict[str, Dict] = {}
 
 def get_members(room_id: str):
     return [
-        {"user": m["user"], "troubled": m["troubled"]}
-        for m in rooms.get(room_id, {}).get("members", {}).values()
+        {"user": u, "troubled": info["troubled"]}
+        for u, info in rooms.get(room_id, {}).get("members", {}).items()
     ]
 
-async def broadcast_to_room(room_id: str, message: dict):
-    """Put message into every queue for that room."""
+async def broadcast(room_id: str, message: dict):
     if room_id not in rooms:
         return
-    for q in rooms[room_id]["queues"]:
+    for q in list(rooms[room_id]["queues"]):
         await q.put(message)
 
-# -------------------------
-# Events endpoint (SSE)
-# -------------------------
-@app.get("/events")
-async def events(request: Request, room: str, sid: str = None):
+# ---------------- SSE endpoint ----------------
+@app.get("/events/{room}/{user}")
+async def events_endpoint(request: Request, room: str, user: str):
     """
-    Client connects to: /events?room=ROOM&sid=SID
-    - SID is optional; provided after /join returns it.
+    Client connects to: GET /events/{room}/{user}
+    On connect: user is added to room.members (troubled=False) and members list is broadcast.
+    On disconnect: user removed and members broadcast.
     """
     if room not in rooms:
-        # initialize
         rooms[room] = {"members": {}, "queues": []}
 
-    queue: asyncio.Queue = asyncio.Queue()
-    rooms[room]["queues"].append(queue)
+    # register member if not exist
+    if user not in rooms[room]["members"]:
+        rooms[room]["members"][user] = {"troubled": False}
 
-    async def send_loop():
+    # create queue for this connection
+    q: asyncio.Queue = asyncio.Queue()
+    rooms[room]["queues"].append(q)
+
+    # broadcast join + members
+    await broadcast(room, {"type": "join", "user": user})
+    await broadcast(room, {"type": "members", "users": get_members(room)})
+
+    async def event_generator():
         try:
             while True:
-                # wait for next message, but timeout for keepalive ping
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    # push as plain message (client expects JSON in data)
+                    msg = await asyncio.wait_for(q.get(), timeout=10.0)
                     yield f"event: message\ndata: {json.dumps(msg, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    # send keepalive ping to prevent Cloudflare closing idle stream
+                    # keepalive ping for Cloudflare
                     yield "event: ping\ndata: keepalive\n\n"
 
-                # detect client disconnect
                 if await request.is_disconnected():
                     break
-        except asyncio.CancelledError:
-            pass
         finally:
-            # remove queue on disconnect
+            # cleanup on disconnect
             try:
-                rooms[room]["queues"].remove(queue)
+                rooms[room]["queues"].remove(q)
             except Exception:
                 pass
+            # remove member and broadcast leave/members
+            if user in rooms[room]["members"]:
+                del rooms[room]["members"][user]
+                await broadcast(room, {"type": "leave", "user": user})
+                await broadcast(room, {"type": "members", "users": get_members(room)})
+            # if no members and no queues, optionally delete room
+            if not rooms[room]["members"] and not rooms[room]["queues"]:
+                del rooms[room]
 
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  # disable buffering for nginx-like proxies
+        "X-Accel-Buffering": "no",
     }
+    return EventSourceResponse(event_generator(), headers=headers)
 
-    return EventSourceResponse(send_loop(), headers=headers)
-
-# -------------------------
-# join endpoint - returns sid
-# -------------------------
-@app.post("/join")
-async def join(data: dict):
-    """
-    body: { "room": "...", "user": "..." }
-    returns: { "sid": "..." }
-    """
-    room = data.get("room")
-    user = data.get("user")
-    if not room or not user:
-        raise HTTPException(status_code=400, detail="room and user required")
-
-    sid = str(uuid4())
-    if room not in rooms:
-        rooms[room] = {"members": {}, "queues": []}
-
-    rooms[room]["members"][sid] = {"user": user, "troubled": False}
-
-    # Broadcast join & members list
-    await broadcast_to_room(room, {"type": "join", "user": user})
-    await broadcast_to_room(room, {"type": "members", "users": get_members(room)})
-
-    return {"sid": sid}
-
-# -------------------------
-# leave endpoint (optional)
-# -------------------------
-@app.post("/leave")
-async def leave(data: dict):
-    room = data.get("room")
-    sid = data.get("sid")
-    if not room or not sid:
-        raise HTTPException(status_code=400)
-    if room in rooms and sid in rooms[room]["members"]:
-        username = rooms[room]["members"][sid]["user"]
-        del rooms[room]["members"][sid]
-        # broadcast leave + members
-        await broadcast_to_room(room, {"type": "leave", "user": username})
-        await broadcast_to_room(room, {"type": "members", "users": get_members(room)})
-    return {"ok": True}
-
-# -------------------------
-# trouble / resolved
-# -------------------------
+# ---------------- client → server endpoints ----------------
 @app.post("/trouble")
 async def trouble(data: dict):
     room = data.get("room")
-    sid = data.get("sid")
-    if not room or not sid or room not in rooms or sid not in rooms[room]["members"]:
-        raise HTTPException(status_code=400)
-    rooms[room]["members"][sid]["troubled"] = True
-    await broadcast_to_room(room, {"type": "trouble", "user": rooms[room]["members"][sid]["user"]})
-    await broadcast_to_room(room, {"type": "members", "users": get_members(room)})
+    user = data.get("user")
+    if not room or not user or room not in rooms or user not in rooms[room]["members"]:
+        raise HTTPException(status_code=400, detail="invalid room/user")
+    rooms[room]["members"][user]["troubled"] = True
+    await broadcast(room, {"type": "trouble", "user": user, "message": "困っています！"})
+    await broadcast(room, {"type": "members", "users": get_members(room)})
     return {"ok": True}
 
 @app.post("/resolved")
 async def resolved(data: dict):
     room = data.get("room")
-    sid = data.get("sid")
-    if not room or not sid or room not in rooms or sid not in rooms[room]["members"]:
+    user = data.get("user")
+    if not room or not user or room not in rooms or user not in rooms[room]["members"]:
+        raise HTTPException(status_code=400, detail="invalid room/user")
+    rooms[room]["members"][user]["troubled"] = False
+    await broadcast(room, {"type": "members", "users": get_members(room)})
+    await broadcast(room, {"type": "resolved", "user": user})
+    return {"ok": True}
+
+@app.post("/leave")
+async def leave(data: dict):
+    room = data.get("room")
+    user = data.get("user")
+    if not room or not user:
         raise HTTPException(status_code=400)
-    rooms[room]["members"][sid]["troubled"] = False
-    await broadcast_to_room(room, {"type": "members", "users": get_members(room)})
+    if room in rooms and user in rooms[room]["members"]:
+        del rooms[room]["members"][user]
+        await broadcast(room, {"type": "leave", "user": user})
+        await broadcast(room, {"type": "members", "users": get_members(room)})
     return {"ok": True}
