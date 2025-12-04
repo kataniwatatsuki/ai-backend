@@ -116,8 +116,6 @@ async def broadcast(room_id: str, message: dict):
 # -------------------------
 @app.get("/events")
 async def events(request: Request, room: str):
-
-    # 初回なら作成
     if room not in rooms:
         rooms[room] = {"members": {}, "queue": asyncio.Queue()}
 
@@ -128,9 +126,13 @@ async def events(request: Request, room: str):
             if await request.is_disconnected():
                 break
             message = await queue.get()
-            yield {"event": "message", "data": message}
+            yield {
+                "event": "message",
+                "data": json.dumps(message)   # ← 修正
+            }
 
     return EventSourceResponse(event_generator())
+
 
 
 # -------------------------
