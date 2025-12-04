@@ -8,17 +8,18 @@ from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
 from typing import Dict
 import socketio
+import uvicorn
 
 # ===== Socket.IO サーバー =====
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins="*"
 )
-app = FastAPI()
-app.mount("/socket.io", socketio.ASGIApp(sio))
 
-# ===== CORS =====
-app.add_middleware(
+# ===== FastAPI 本体 =====
+fastapi_app = FastAPI()
+
+fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -64,7 +65,7 @@ def predict_expression(face_img):
 # ========================
 # /predict 表情認識API
 # ========================
-@app.post("/predict")
+@fastapi_app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     np_arr = np.frombuffer(contents, np.uint8)
@@ -151,3 +152,9 @@ async def resolved(sid, data):
     if room_id in rooms and sid in rooms[room_id]:
         rooms[room_id][sid]["troubled"] = False
         await sio.emit("members", {"users": get_members(room_id)}, room=room_id)
+
+# ===== Socket.IO + FastAPI の統合 =====
+app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
