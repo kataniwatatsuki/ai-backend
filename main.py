@@ -11,6 +11,7 @@ from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
 from typing import Dict
 from uuid import uuid4
+import json
 
 # -------------------------
 # FastAPI 本体
