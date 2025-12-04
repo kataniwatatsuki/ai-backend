@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 import asyncio
+import json
 
 import cv2
 import numpy as np
@@ -11,7 +12,6 @@ from efficientnet_pytorch import EfficientNet
 import mediapipe as mp
 from typing import Dict
 from uuid import uuid4
-import json
 
 # -------------------------
 # FastAPI 本体
